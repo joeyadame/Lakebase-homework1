@@ -1,368 +1,463 @@
-import streamlit as st
+"""
+Databricks App for an internal support ticket system.
+
+The app serves a small Flask UI/API and stores operational data in Lakebase
+(Databricks-managed Postgres) through lakebase.py.
+"""
+
+from __future__ import annotations
+
+import logging
 import os
-import uuid
-import psycopg2
+from datetime import date, datetime
+from decimal import Decimal
+from typing import Any
+
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except Exception:
+    pass
+
 from databricks.sdk import WorkspaceClient
-from datetime import datetime
-import time
+from flask import Flask, jsonify, render_template, request
 
-# Page configuration
-st.set_page_config(
-    page_title="Support Ticket System",
-    page_icon="🎫",
-    layout="wide"
-)
+import lakebase
 
-# Initialize workspace client and connection
-@st.cache_resource
-def get_db_connection():
-    """Create a connection to Lakebase Postgres"""
-    try:
-        w = WorkspaceClient()
-        cred = w.database.generate_database_credential(
-            request_id=str(uuid.uuid4()),
-            instance_names=[os.environ["LAKEBASE_DB_PGDATABASE"]]
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("support-app")
+
+app = Flask(__name__)
+_w: WorkspaceClient | None = None
+
+STATUSES = ("open", "in_progress", "resolved")
+PRIORITIES = ("low", "normal", "high", "urgent")
+MAX_TITLE_LENGTH = 140
+MAX_MESSAGE_LENGTH = 5000
+
+_SCHEMA_READY = False
+
+
+def _workspace_client() -> WorkspaceClient:
+    global _w
+    if _w is None:
+        _w = WorkspaceClient()
+    return _w
+
+
+def ensure_schema() -> None:
+    """Create the Lakebase tables needed by the support app."""
+    global _SCHEMA_READY
+    if _SCHEMA_READY:
+        return
+
+    lakebase.run_write(
+        """
+        CREATE TABLE IF NOT EXISTS tickets (
+            ticket_id TEXT PRIMARY KEY
+                DEFAULT md5(random()::text || clock_timestamp()::text),
+            title TEXT NOT NULL CHECK (length(trim(title)) > 0),
+            status TEXT NOT NULL DEFAULT 'open'
+                CHECK (status IN ('open', 'in_progress', 'resolved')),
+            priority TEXT NOT NULL DEFAULT 'normal'
+                CHECK (priority IN ('low', 'normal', 'high', 'urgent')),
+            created_by TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )
-        
-        conn = psycopg2.connect(
-            host=os.environ["LAKEBASE_DB_PGHOST"],
-            database=os.environ["LAKEBASE_DB_PGDATABASE"],
-            user=os.environ["LAKEBASE_DB_PGUSER"],
-            port=os.environ.get("LAKEBASE_DB_PGPORT", 5432),
-            password=cred.token,
-            sslmode="require"
+        """
+    )
+    lakebase.run_write(
+        """
+        CREATE TABLE IF NOT EXISTS ticket_messages (
+            message_id TEXT PRIMARY KEY
+                DEFAULT md5(random()::text || clock_timestamp()::text),
+            ticket_id TEXT NOT NULL
+                REFERENCES tickets(ticket_id) ON DELETE CASCADE,
+            message_text TEXT NOT NULL CHECK (length(trim(message_text)) > 0),
+            author TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )
-        return conn
-    except Exception as e:
-        st.error(f"Failed to connect to database: {str(e)}")
-        return None
+        """
+    )
+    lakebase.run_write(
+        """
+        CREATE INDEX IF NOT EXISTS idx_tickets_status_updated_at
+            ON tickets (status, updated_at DESC)
+        """
+    )
+    lakebase.run_write(
+        """
+        CREATE INDEX IF NOT EXISTS idx_ticket_messages_ticket_created
+            ON ticket_messages (ticket_id, created_at ASC)
+        """
+    )
+    _SCHEMA_READY = True
 
-def execute_query(query, params=None, fetch=True):
-    """Execute a database query"""
-    conn = get_db_connection()
-    if not conn:
-        return None
-    
+
+def _current_user_email() -> str:
+    """Resolve the current Databricks user, with a local-dev fallback."""
+    header_email = request.headers.get("X-Forwarded-Email")
+    if header_email:
+        return header_email.strip()
     try:
+        return _workspace_client().current_user.me().user_name
+    except Exception:
+        return "local.user@example.com"
+
+
+def _json_ready(value: Any) -> Any:
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return float(value)
+    return value
+
+
+def _serialize_row(row: Any) -> dict[str, Any]:
+    return {key: _json_ready(value) for key, value in dict(row).items()}
+
+
+def _serialize_rows(rows: list[Any]) -> list[dict[str, Any]]:
+    return [_serialize_row(row) for row in rows]
+
+
+def _payload() -> dict[str, Any]:
+    return (request.get_json(silent=True) or {}) if request.is_json else {}
+
+
+def _clean_text(value: Any, *, collapse: bool = False) -> str:
+    if not isinstance(value, str):
+        return ""
+    value = value.strip()
+    if collapse:
+        value = " ".join(value.split())
+    return value
+
+
+def _error(message: str, status_code: int = 400):
+    return jsonify({"error": message}), status_code
+
+
+def _validate_status(status: str) -> str | None:
+    status = _clean_text(status).lower()
+    return status if status in STATUSES else None
+
+
+def _validate_priority(priority: str) -> str | None:
+    priority = _clean_text(priority).lower()
+    return priority if priority in PRIORITIES else None
+
+
+def _fetch_ticket(ticket_id: str) -> dict[str, Any] | None:
+    rows = lakebase.run_query(
+        """
+        SELECT
+            t.ticket_id,
+            t.title,
+            t.status,
+            t.priority,
+            t.created_by,
+            t.created_at,
+            t.updated_at,
+            COUNT(m.message_id)::int AS message_count,
+            MAX(m.created_at) AS latest_message_at
+        FROM tickets t
+        LEFT JOIN ticket_messages m ON m.ticket_id = t.ticket_id
+        WHERE t.ticket_id = %s
+        GROUP BY
+            t.ticket_id,
+            t.title,
+            t.status,
+            t.priority,
+            t.created_by,
+            t.created_at,
+            t.updated_at
+        """,
+        (ticket_id,),
+    )
+    return _serialize_row(rows[0]) if rows else None
+
+
+@app.errorhandler(Exception)
+def handle_exception(err):
+    logger.exception("Unhandled exception while processing request")
+    status_code = getattr(err, "code", 500)
+    if not isinstance(status_code, int):
+        status_code = 500
+    return jsonify({"error": str(err)}), status_code
+
+
+@app.route("/healthz")
+def healthz():
+    return jsonify({"status": "ok"})
+
+
+@app.route("/")
+def index():
+    return render_template(
+        "index.html",
+        statuses=STATUSES,
+        priorities=PRIORITIES,
+        current_user=_current_user_email(),
+    )
+
+
+@app.route("/api/tickets", methods=["GET"])
+def list_tickets():
+    ensure_schema()
+
+    status_filter = _clean_text(request.args.get("status", "all")).lower() or "all"
+    search = _clean_text(request.args.get("q", ""), collapse=True)
+
+    conditions = []
+    params: list[Any] = []
+
+    if status_filter != "all":
+        status = _validate_status(status_filter)
+        if status is None:
+            return _error(f"Status must be one of: {', '.join(STATUSES)}")
+        conditions.append("t.status = %s")
+        params.append(status)
+
+    if search:
+        conditions.append("t.title ILIKE %s")
+        params.append(f"%{search}%")
+
+    where_sql = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    rows = lakebase.run_query(
+        f"""
+        SELECT
+            t.ticket_id,
+            t.title,
+            t.status,
+            t.priority,
+            t.created_by,
+            t.created_at,
+            t.updated_at,
+            COUNT(m.message_id)::int AS message_count,
+            MAX(m.created_at) AS latest_message_at
+        FROM tickets t
+        LEFT JOIN ticket_messages m ON m.ticket_id = t.ticket_id
+        {where_sql}
+        GROUP BY
+            t.ticket_id,
+            t.title,
+            t.status,
+            t.priority,
+            t.created_by,
+            t.created_at,
+            t.updated_at
+        ORDER BY
+            CASE t.status
+                WHEN 'open' THEN 1
+                WHEN 'in_progress' THEN 2
+                WHEN 'resolved' THEN 3
+                ELSE 4
+            END,
+            t.updated_at DESC
+        """,
+        tuple(params),
+    )
+    return jsonify({"tickets": _serialize_rows(rows)})
+
+
+@app.route("/api/tickets", methods=["POST"])
+def create_ticket():
+    ensure_schema()
+    data = _payload()
+
+    title = _clean_text(data.get("title"), collapse=True)
+    status = _validate_status(data.get("status", "open"))
+    priority = _validate_priority(data.get("priority", "normal"))
+    created_by = _clean_text(data.get("created_by"), collapse=True) or _current_user_email()
+    message_text = _clean_text(
+        data.get("message_text") or data.get("initial_message"),
+        collapse=False,
+    )
+
+    if not title:
+        return _error("Ticket title is required.")
+    if len(title) > MAX_TITLE_LENGTH:
+        return _error(f"Ticket title must be {MAX_TITLE_LENGTH} characters or fewer.")
+    if status is None:
+        return _error(f"Status must be one of: {', '.join(STATUSES)}")
+    if priority is None:
+        return _error(f"Priority must be one of: {', '.join(PRIORITIES)}")
+    if len(message_text) > MAX_MESSAGE_LENGTH:
+        return _error(f"Message must be {MAX_MESSAGE_LENGTH} characters or fewer.")
+
+    with lakebase.get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(query, params)
-            if fetch:
-                columns = [desc[0] for desc in cur.description]
-                results = cur.fetchall()
-                return [dict(zip(columns, row)) for row in results]
-            else:
-                conn.commit()
-                return True
-    except Exception as e:
-        st.error(f"Database error: {str(e)}")
-        conn.rollback()
-        return None
+            cur.execute(
+                """
+                INSERT INTO tickets (
+                    title, status, priority, created_by, created_at, updated_at
+                )
+                VALUES (%s, %s, %s, %s, now(), now())
+                RETURNING
+                    ticket_id,
+                    title,
+                    status,
+                    priority,
+                    created_by,
+                    created_at,
+                    updated_at
+                """,
+                (title, status, priority, created_by),
+            )
+            ticket = cur.fetchone()
 
-def get_all_tickets(status_filter=None):
-    """Fetch all tickets, optionally filtered by status"""
-    query = """
-        SELECT ticket_id, title, status, priority, created_by, assigned_to, 
-               created_at, updated_at
-        FROM tickets
-    """
-    if status_filter and status_filter != "All":
-        query += " WHERE status = %s"
-        return execute_query(query, (status_filter.lower(),))
-    else:
-        query += " ORDER BY created_at DESC"
-        return execute_query(query)
+            message = None
+            if message_text:
+                cur.execute(
+                    """
+                    INSERT INTO ticket_messages (
+                        ticket_id, message_text, author, created_at
+                    )
+                    VALUES (%s, %s, %s, now())
+                    RETURNING
+                        message_id,
+                        ticket_id,
+                        message_text,
+                        author,
+                        created_at
+                    """,
+                    (ticket["ticket_id"], message_text, created_by),
+                )
+                message = cur.fetchone()
 
-def get_ticket_messages(ticket_id):
-    """Fetch all messages for a specific ticket"""
-    query = """
-        SELECT message_id, ticket_id, message_text, author, is_internal, created_at
+            conn.commit()
+
+    response = {
+        "ticket": _serialize_row(ticket),
+        "message": _serialize_row(message) if message else None,
+    }
+    return jsonify(response), 201
+
+
+@app.route("/api/tickets/<ticket_id>", methods=["GET"])
+def get_ticket(ticket_id: str):
+    ensure_schema()
+    ticket = _fetch_ticket(ticket_id)
+    if ticket is None:
+        return _error("Ticket not found.", 404)
+
+    messages = lakebase.run_query(
+        """
+        SELECT message_id, ticket_id, message_text, author, created_at
         FROM ticket_messages
         WHERE ticket_id = %s
         ORDER BY created_at ASC
-    """
-    return execute_query(query, (ticket_id,))
-
-def create_ticket(title, status, priority, created_by, assigned_to=None):
-    """Create a new support ticket"""
-    query = """
-        INSERT INTO tickets (title, status, priority, created_by, assigned_to)
-        VALUES (%s, %s, %s, %s, %s)
-        RETURNING ticket_id
-    """
-    result = execute_query(query, (title, status, priority, created_by, assigned_to), fetch=True)
-    return result[0]['ticket_id'] if result else None
-
-def add_message(ticket_id, message_text, author, is_internal=False):
-    """Add a message to a ticket"""
-    query = """
-        INSERT INTO ticket_messages (ticket_id, message_text, author, is_internal)
-        VALUES (%s, %s, %s, %s)
-    """
-    return execute_query(query, (ticket_id, message_text, author, is_internal), fetch=False)
-
-def update_ticket_status(ticket_id, new_status):
-    """Update the status of a ticket"""
-    query = """
-        UPDATE tickets
-        SET status = %s, updated_at = CURRENT_TIMESTAMP
-        WHERE ticket_id = %s
-    """
-    return execute_query(query, (new_status, ticket_id), fetch=False)
-
-def get_ticket_stats():
-    """Get ticket statistics"""
-    query = """
-        SELECT 
-            COUNT(*) as total_tickets,
-            COUNT(CASE WHEN status = 'open' THEN 1 END) as open_tickets,
-            COUNT(CASE WHEN status = 'in_progress' THEN 1 END) as in_progress_tickets,
-            COUNT(CASE WHEN status = 'resolved' THEN 1 END) as resolved_tickets,
-            COUNT(CASE WHEN status = 'closed' THEN 1 END) as closed_tickets
-        FROM tickets
-    """
-    return execute_query(query)
-
-# Sidebar navigation
-st.sidebar.title("🎫 Support Ticket System")
-page = st.sidebar.radio(
-    "Navigation",
-    ["Dashboard", "Create Ticket", "Ticket Details"]
-)
-
-# Dashboard Page
-if page == "Dashboard":
-    st.title("Support Ticket Dashboard")
-    
-    # Show statistics
-    stats = get_ticket_stats()
-    if stats:
-        stat = stats[0]
-        col1, col2, col3, col4, col5 = st.columns(5)
-        col1.metric("Total Tickets", stat['total_tickets'])
-        col2.metric("Open", stat['open_tickets'])
-        col3.metric("In Progress", stat['in_progress_tickets'])
-        col4.metric("Resolved", stat['resolved_tickets'])
-        col5.metric("Closed", stat['closed_tickets'])
-    
-    st.markdown("---")
-    
-    # Filter by status
-    status_filter = st.selectbox(
-        "Filter by Status",
-        ["All", "Open", "In Progress", "Resolved", "Closed"]
+        """,
+        (ticket_id,),
     )
-    
-    # Display tickets
-    tickets = get_all_tickets(status_filter if status_filter != "All" else None)
-    
-    if tickets:
-        st.subheader(f"Tickets ({len(tickets)})")
-        
-        for ticket in tickets:
-            with st.expander(f"🎫 #{ticket['ticket_id']} - {ticket['title']}"):
-                col1, col2, col3 = st.columns(3)
-                
-                with col1:
-                    st.write(f"**Status:** {ticket['status'].replace('_', ' ').title()}")
-                    st.write(f"**Priority:** {ticket['priority'].title()}")
-                
-                with col2:
-                    st.write(f"**Created By:** {ticket['created_by']}")
-                    st.write(f"**Assigned To:** {ticket['assigned_to'] or 'Unassigned'}")
-                
-                with col3:
-                    st.write(f"**Created:** {ticket['created_at'].strftime('%Y-%m-%d %H:%M') if ticket['created_at'] else 'N/A'}")
-                    st.write(f"**Updated:** {ticket['updated_at'].strftime('%Y-%m-%d %H:%M') if ticket['updated_at'] else 'N/A'}")
-                
-                # Quick actions
-                col1, col2, col3 = st.columns([1, 1, 3])
-                with col1:
-                    if st.button("View Details", key=f"view_{ticket['ticket_id']}"):
-                        st.session_state['selected_ticket_id'] = ticket['ticket_id']
-                        st.rerun()
-                
-                with col2:
-                    new_status = st.selectbox(
-                        "Update Status",
-                        ["open", "in_progress", "resolved", "closed"],
-                        index=["open", "in_progress", "resolved", "closed"].index(ticket['status']),
-                        key=f"status_{ticket['ticket_id']}"
-                    )
-                    if new_status != ticket['status']:
-                        if st.button("Update", key=f"update_{ticket['ticket_id']}"):
-                            if update_ticket_status(ticket['ticket_id'], new_status):
-                                st.success(f"Status updated to {new_status}!")
-                                time.sleep(1)
-                                st.rerun()
-    else:
-        st.info("No tickets found.")
+    return jsonify({"ticket": ticket, "messages": _serialize_rows(messages)})
 
-# Create Ticket Page
-elif page == "Create Ticket":
-    st.title("Create New Support Ticket")
-    
-    with st.form("create_ticket_form"):
-        title = st.text_input("Ticket Title*", placeholder="Brief description of the issue")
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            status = st.selectbox("Status*", ["open", "in_progress", "resolved", "closed"])
-            priority = st.selectbox("Priority*", ["low", "medium", "high", "urgent"])
-        
-        with col2:
-            created_by = st.text_input("Created By (Email)*", placeholder="your.email@company.com")
-            assigned_to = st.text_input("Assign To (Email)", placeholder="agent.email@company.com")
-        
-        initial_message = st.text_area(
-            "Initial Message*",
-            placeholder="Describe the issue in detail...",
-            height=150
-        )
-        
-        submitted = st.form_submit_button("Create Ticket")
-        
-        if submitted:
-            # Validation
-            if not title or not created_by or not initial_message:
-                st.error("Please fill in all required fields (marked with *)")
-            elif "@" not in created_by:
-                st.error("Please enter a valid email address for 'Created By'")
-            else:
-                # Create ticket
-                ticket_id = create_ticket(
-                    title=title,
-                    status=status,
-                    priority=priority,
-                    created_by=created_by,
-                    assigned_to=assigned_to if assigned_to else None
-                )
-                
-                if ticket_id:
-                    # Add initial message
-                    if add_message(ticket_id, initial_message, created_by):
-                        st.success(f"✅ Ticket #{ticket_id} created successfully!")
-                        st.balloons()
-                        time.sleep(2)
-                        st.session_state['selected_ticket_id'] = ticket_id
-                        st.rerun()
-                    else:
-                        st.error("Ticket created but failed to add initial message")
-                else:
-                    st.error("Failed to create ticket")
 
-# Ticket Details Page
-elif page == "Ticket Details":
-    st.title("Ticket Details")
-    
-    # Check if a ticket is selected
-    if 'selected_ticket_id' not in st.session_state:
-        st.info("Please select a ticket from the Dashboard to view details.")
-        if st.button("Go to Dashboard"):
-            st.switch_page("app.py")
-    else:
-        ticket_id = st.session_state['selected_ticket_id']
-        
-        # Fetch ticket details
-        tickets = execute_query(
-            "SELECT * FROM tickets WHERE ticket_id = %s",
-            (ticket_id,)
-        )
-        
-        if not tickets:
-            st.error(f"Ticket #{ticket_id} not found.")
-            if st.button("Back to Dashboard"):
-                del st.session_state['selected_ticket_id']
-                st.rerun()
-        else:
-            ticket = tickets[0]
-            
-            # Display ticket header
-            col1, col2 = st.columns([3, 1])
-            with col1:
-                st.header(f"🎫 Ticket #{ticket['ticket_id']}: {ticket['title']}")
-            with col2:
-                if st.button("← Back to Dashboard"):
-                    del st.session_state['selected_ticket_id']
-                    st.rerun()
-            
-            # Ticket info
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("Status", ticket['status'].replace('_', ' ').title())
-            col2.metric("Priority", ticket['priority'].title())
-            col3.write(f"**Created By:** {ticket['created_by']}")
-            col4.write(f"**Assigned To:** {ticket['assigned_to'] or 'Unassigned'}")
-            
-            st.markdown("---")
-            
-            # Update status section
-            st.subheader("Update Ticket Status")
-            col1, col2 = st.columns([2, 3])
-            with col1:
-                new_status = st.selectbox(
-                    "Change Status",
-                    ["open", "in_progress", "resolved", "closed"],
-                    index=["open", "in_progress", "resolved", "closed"].index(ticket['status'])
-                )
-                if new_status != ticket['status']:
-                    if st.button("Update Status"):
-                        if update_ticket_status(ticket_id, new_status):
-                            st.success(f"Status updated to {new_status}!")
-                            time.sleep(1)
-                            st.rerun()
-            
-            st.markdown("---")
-            
-            # Messages section
-            st.subheader("Messages")
-            messages = get_ticket_messages(ticket_id)
-            
-            if messages:
-                for msg in messages:
-                    with st.container():
-                        col1, col2 = st.columns([4, 1])
-                        with col1:
-                            st.markdown(f"**{msg['author']}** {'🔒 (Internal)' if msg['is_internal'] else ''}")
-                        with col2:
-                            st.caption(msg['created_at'].strftime('%Y-%m-%d %H:%M') if msg['created_at'] else '')
-                        
-                        st.write(msg['message_text'])
-                        st.markdown("---")
-            else:
-                st.info("No messages yet.")
-            
-            # Add message form
-            st.subheader("Add Message")
-            with st.form("add_message_form"):
-                col1, col2 = st.columns([3, 1])
-                with col1:
-                    message_author = st.text_input(
-                        "Your Email*",
-                        placeholder="your.email@company.com"
-                    )
-                with col2:
-                    is_internal = st.checkbox("Internal Message")
-                
-                message_text = st.text_area(
-                    "Message*",
-                    placeholder="Type your message here...",
-                    height=100
-                )
-                
-                submit_message = st.form_submit_button("Send Message")
-                
-                if submit_message:
-                    if not message_author or not message_text:
-                        st.error("Please fill in all required fields")
-                    elif "@" not in message_author:
-                        st.error("Please enter a valid email address")
-                    else:
-                        if add_message(ticket_id, message_text, message_author, is_internal):
-                            st.success("✅ Message added successfully!")
-                            time.sleep(1)
-                            st.rerun()
-                        else:
-                            st.error("Failed to add message")
+@app.route("/api/tickets/<ticket_id>/messages", methods=["POST"])
+def add_ticket_message(ticket_id: str):
+    ensure_schema()
+    data = _payload()
 
-# Footer
-st.sidebar.markdown("---")
-st.sidebar.caption("Built with Databricks Apps + Lakebase")
+    message_text = _clean_text(data.get("message_text"), collapse=False)
+    author = _clean_text(data.get("author"), collapse=True) or _current_user_email()
+
+    if not message_text:
+        return _error("Message text is required.")
+    if len(message_text) > MAX_MESSAGE_LENGTH:
+        return _error(f"Message must be {MAX_MESSAGE_LENGTH} characters or fewer.")
+
+    with lakebase.get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT ticket_id FROM tickets WHERE ticket_id = %s", (ticket_id,))
+            if cur.fetchone() is None:
+                return _error("Ticket not found.", 404)
+
+            cur.execute(
+                """
+                INSERT INTO ticket_messages (
+                    ticket_id, message_text, author, created_at
+                )
+                VALUES (%s, %s, %s, now())
+                RETURNING message_id, ticket_id, message_text, author, created_at
+                """,
+                (ticket_id, message_text, author),
+            )
+            message = cur.fetchone()
+            cur.execute(
+                "UPDATE tickets SET updated_at = now() WHERE ticket_id = %s",
+                (ticket_id,),
+            )
+            conn.commit()
+
+    return jsonify({"message": _serialize_row(message)}), 201
+
+
+@app.route("/api/tickets/<ticket_id>/status", methods=["PATCH"])
+def update_ticket_status(ticket_id: str):
+    ensure_schema()
+    data = _payload()
+    status = _validate_status(data.get("status", ""))
+
+    if status is None:
+        return _error(f"Status must be one of: {', '.join(STATUSES)}")
+
+    with lakebase.get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE tickets
+                SET status = %s, updated_at = now()
+                WHERE ticket_id = %s
+                RETURNING ticket_id
+                """,
+                (status, ticket_id),
+            )
+            updated = cur.fetchone()
+            conn.commit()
+
+    if updated is None:
+        return _error("Ticket not found.", 404)
+
+    return jsonify({"ticket": _fetch_ticket(ticket_id)})
+
+
+@app.route("/api/tickets/<ticket_id>", methods=["DELETE"])
+def delete_ticket(ticket_id: str):
+    ensure_schema()
+    row_count = lakebase.run_write(
+        "DELETE FROM tickets WHERE ticket_id = %s",
+        (ticket_id,),
+    )
+    if row_count == 0:
+        return _error("Ticket not found.", 404)
+    return jsonify({"deleted": True, "ticket_id": ticket_id})
+
+
+@app.route("/api/stats")
+def ticket_stats():
+    ensure_schema()
+    rows = lakebase.run_query(
+        """
+        SELECT
+            COUNT(*)::int AS total_tickets,
+            COUNT(*) FILTER (WHERE status = 'open')::int AS open_tickets,
+            COUNT(*) FILTER (WHERE status = 'in_progress')::int AS in_progress_tickets,
+            COUNT(*) FILTER (WHERE status = 'resolved')::int AS resolved_tickets,
+            (
+                SELECT COUNT(*)::int
+                FROM ticket_messages
+            ) AS total_messages
+        FROM tickets
+        """
+    )
+    return jsonify({"stats": _serialize_row(rows[0])})
+
+
+if __name__ == "__main__":
+    host = os.getenv("FLASK_RUN_HOST", "0.0.0.0")
+    port = int(os.getenv("FLASK_RUN_PORT", os.getenv("PORT", "8000")))
+    debug = os.getenv("FLASK_DEBUG", "false").lower() == "true"
+    app.run(host=host, port=port, debug=debug)
