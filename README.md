@@ -22,6 +22,7 @@ for this repo said to ignore the sample-data requirement.
 - `lakebase.py` - Lakebase Postgres connection helper.
 - `templates/index.html` - Ticket dashboard UI.
 - `setup_secrets.py` - One-time helper for storing the Lakebase URL in Databricks secrets.
+- `get_lakebase_password.py` - Helper for printing a temporary Lakebase password/token.
 - `app.yaml` - Databricks Apps deployment config.
 - `.env.example` - Local development environment template.
 
@@ -53,7 +54,31 @@ CREATE TABLE IF NOT EXISTS ticket_messages (
 
 The included `app.yaml` keeps the Lakebase resource wiring that Databricks Apps
 can inject at runtime. If your workspace uses that resource, the app can request
-a database credential from Databricks automatically.
+a database credential from Databricks automatically. It sets `ENDPOINT_NAME`
+from the `lakebase-db` resource, and `lakebase.py` uses that to generate a
+short-lived database password/token when the app connects.
+
+You can use this GitHub repo URL as the Databricks App source:
+
+```text
+https://github.com/joeyadame/Lakebase-homework1.git
+```
+
+For local testing, or if you want to inspect the generated password before
+deployment, run:
+
+```bash
+python get_lakebase_password.py --endpoint-name projects/<project>/branches/<branch>/endpoints/<endpoint>
+```
+
+To print shell-ready environment variables instead:
+
+```bash
+python get_lakebase_password.py --format env
+```
+
+The generated password/token is temporary. Do not commit it and do not store it
+as the long-term deployment secret.
 
 The template-style fallback is a Lakebase connection URL stored as a Databricks
 secret. Create a Lakebase instance in Databricks and create a native-password

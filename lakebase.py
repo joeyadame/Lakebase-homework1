@@ -1,8 +1,13 @@
 """
 Lakebase (Databricks-managed Postgres) connection helper.
 
-In Databricks Apps, the connection URL is read from a Databricks secret. For
-local development, set LAKEBASE_URL in your environment or .env file.
+Connection order:
+1. LAKEBASE_URL/DATABASE_URL, for native-password local development.
+2. Standard PG* env vars plus PGPASSWORD, for local psql-style config.
+3. Standard PG* env vars plus ENDPOINT_NAME, for Databricks Apps/Lakebase
+   resources that generate short-lived OAuth database credentials.
+4. Legacy LAKEBASE_DB_* resource vars, for older provisioned-database examples.
+5. Databricks secret database/lakebase-url as a final fallback.
 """
 
 from __future__ import annotations
@@ -37,7 +42,45 @@ def _decode_secret(value: str) -> str:
         return value
 
 
-def _has_lakebase_resource_env() -> bool:
+def _direct_database_url() -> str | None:
+    return os.environ.get("LAKEBASE_URL") or os.environ.get("DATABASE_URL")
+
+
+def _has_standard_pg_env() -> bool:
+    required = ("PGHOST", "PGDATABASE", "PGUSER")
+    return all(os.environ.get(name) for name in required)
+
+
+def _standard_pg_params() -> dict:
+    password = os.environ.get("PGPASSWORD")
+    if not password:
+        password = _generate_standard_pg_password()
+
+    return {
+        "host": os.environ["PGHOST"],
+        "database": os.environ["PGDATABASE"],
+        "user": os.environ["PGUSER"],
+        "port": int(os.environ.get("PGPORT", "5432")),
+        "password": password,
+        "sslmode": os.environ.get("PGSSLMODE", "require"),
+    }
+
+
+def _generate_standard_pg_password() -> str:
+    endpoint = os.environ.get("ENDPOINT_NAME") or os.environ.get("LAKEBASE_ENDPOINT")
+    if not endpoint:
+        raise RuntimeError(
+            "PGPASSWORD is not set. Set ENDPOINT_NAME to the Lakebase endpoint "
+            "resource path so the app can generate a temporary database credential."
+        )
+
+    credential = _workspace_client().postgres.generate_database_credential(
+        endpoint=endpoint,
+    )
+    return credential.token
+
+
+def _has_legacy_lakebase_resource_env() -> bool:
     required = (
         "LAKEBASE_DB_PGHOST",
         "LAKEBASE_DB_PGDATABASE",
@@ -46,7 +89,7 @@ def _has_lakebase_resource_env() -> bool:
     return all(os.environ.get(name) for name in required)
 
 
-def _lakebase_resource_params() -> dict:
+def _legacy_lakebase_resource_params() -> dict:
     database = os.environ["LAKEBASE_DB_PGDATABASE"]
     credential = _workspace_client().database.generate_database_credential(
         request_id=str(uuid.uuid4()),
@@ -70,12 +113,17 @@ def _lakebase_secret_url() -> str:
 @contextmanager
 def get_connection():
     """Yield a raw psycopg2 connection with dict-like rows."""
-    direct_url = os.environ.get("LAKEBASE_URL")
+    direct_url = _direct_database_url()
     if direct_url:
         conn = psycopg2.connect(direct_url, cursor_factory=RealDictCursor)
-    elif _has_lakebase_resource_env():
+    elif _has_standard_pg_env():
         conn = psycopg2.connect(
-            **_lakebase_resource_params(),
+            **_standard_pg_params(),
+            cursor_factory=RealDictCursor,
+        )
+    elif _has_legacy_lakebase_resource_env():
+        conn = psycopg2.connect(
+            **_legacy_lakebase_resource_params(),
             cursor_factory=RealDictCursor,
         )
     else:
@@ -89,11 +137,23 @@ def get_connection():
 
 def get_engine():
     """Return a SQLAlchemy engine for Lakebase."""
-    direct_url = os.environ.get("LAKEBASE_URL")
+    direct_url = _direct_database_url()
     if direct_url:
         return create_engine(direct_url)
-    if _has_lakebase_resource_env():
-        params = _lakebase_resource_params()
+    if _has_standard_pg_env():
+        params = _standard_pg_params()
+        url = URL.create(
+            "postgresql+psycopg2",
+            username=params["user"],
+            password=params["password"],
+            host=params["host"],
+            port=params["port"],
+            database=params["database"],
+            query={"sslmode": params["sslmode"]},
+        )
+        return create_engine(url)
+    if _has_legacy_lakebase_resource_env():
+        params = _legacy_lakebase_resource_params()
         url = URL.create(
             "postgresql+psycopg2",
             username=params["user"],

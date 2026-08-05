@@ -3,6 +3,8 @@ command:
   - "app.py"
 
 env:
+  - name: ENDPOINT_NAME
+    valueFrom: lakebase-db
   - name: LAKEBASE_SECRET_SCOPE
     value: "database"
   - name: LAKEBASE_SECRET_KEY
