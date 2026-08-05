@@ -2,8 +2,8 @@
 Lakebase (Databricks-managed Postgres) connection helper.
 
 Connection order:
-1. LAKEBASE_URL/DATABASE_URL, for native-password local development.
-2. Standard PG* env vars plus PGPASSWORD, for local psql-style config.
+1. Standard PG* env vars plus PGPASSWORD, for local psql-style config.
+2. LAKEBASE_URL/DATABASE_URL, for native-password local development.
 3. Standard PG* env vars plus ENDPOINT_NAME, for Databricks Apps/Lakebase
    resources that generate short-lived OAuth database credentials.
 4. Legacy LAKEBASE_DB_* resource vars, for older provisioned-database examples.
@@ -114,7 +114,12 @@ def _lakebase_secret_url() -> str:
 def get_connection():
     """Yield a raw psycopg2 connection with dict-like rows."""
     direct_url = _direct_database_url()
-    if direct_url:
+    if _has_standard_pg_env() and os.environ.get("PGPASSWORD"):
+        conn = psycopg2.connect(
+            **_standard_pg_params(),
+            cursor_factory=RealDictCursor,
+        )
+    elif direct_url:
         conn = psycopg2.connect(direct_url, cursor_factory=RealDictCursor)
     elif _has_standard_pg_env():
         conn = psycopg2.connect(
@@ -138,6 +143,18 @@ def get_connection():
 def get_engine():
     """Return a SQLAlchemy engine for Lakebase."""
     direct_url = _direct_database_url()
+    if _has_standard_pg_env() and os.environ.get("PGPASSWORD"):
+        params = _standard_pg_params()
+        url = URL.create(
+            "postgresql+psycopg2",
+            username=params["user"],
+            password=params["password"],
+            host=params["host"],
+            port=params["port"],
+            database=params["database"],
+            query={"sslmode": params["sslmode"]},
+        )
+        return create_engine(url)
     if direct_url:
         return create_engine(direct_url)
     if _has_standard_pg_env():

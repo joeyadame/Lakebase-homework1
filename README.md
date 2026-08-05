@@ -109,6 +109,19 @@ python app.py
 
 Open `http://localhost:8000`.
 
+If you have a Postgres-style env file with `PGUSER` and `PGPASSWORD`, place it
+in `.env` and add:
+
+```text
+PGHOST=<your-lakebase-host>
+PGDATABASE=databricks_postgres
+PGPORT=5432
+PGSSLMODE=require
+```
+
+When `PGHOST`, `PGDATABASE`, `PGUSER`, and `PGPASSWORD` are present, the app
+uses those values before falling back to `LAKEBASE_URL`.
+
 ## Deploy As A Databricks App
 
 1. Push this repo to GitHub.
@@ -118,6 +131,20 @@ Open `http://localhost:8000`.
    resource plus the secret fallback settings.
 5. Open the app and create a ticket. Refresh the page to confirm the ticket,
    message, and status changes persisted in Lakebase.
+
+## Deployment Troubleshooting
+
+If Databricks fails before building with:
+
+```text
+Sparse checkout pattern must a valid folder path without leading slash
+```
+
+the source checkout settings are pointing at `/` or another invalid sparse
+checkout value. This repo's app files live at the repository root, so create the
+Git folder without sparse checkout enabled. If your Databricks UI requires an
+app source folder/path, leave sparse checkout off and point the app at the Git
+folder root rather than entering `/`.
 
 ## API
 
