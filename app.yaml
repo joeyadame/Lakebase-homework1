@@ -1,0 +1,13 @@
+command:
+  - streamlit
+  - run
+  - app.py
+  - --server.port
+  - "8080"
+
+resources:
+  - name: lakebase-db
+    lakebase:
+      project_name: bootcamp
+      branch: production
+      endpoint: default
