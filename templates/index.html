@@ -295,12 +295,19 @@
       border-color: #c7d8ea;
     }
 
+    .status-closed {
+      color: #4b5563;
+      background: #eef0f3;
+      border-color: #d1d5db;
+    }
+
     .priority-low {
       color: #315070;
       background: #eef4fa;
       border-color: #d8e4ef;
     }
 
+    .priority-medium,
     .priority-normal {
       color: #344054;
       background: #f2f4f7;
@@ -532,7 +539,7 @@
                   <label for="ticket-priority">Priority</label>
                   <select id="ticket-priority" name="priority">
                     {% for priority in priorities %}
-                    <option value="{{ priority }}" {% if priority == "normal" %}selected{% endif %}>{{ priority.title() }}</option>
+                    <option value="{{ priority }}" {% if priority == "low" %}selected{% endif %}>{{ priority.title() }}</option>
                     {% endfor %}
                   </select>
                 </div>
@@ -708,7 +715,7 @@
           </div>
           <div class="badges">
             <span class="${badgeClass("status", ticket.status)}">${formatStatus(ticket.status)}</span>
-            <span class="badge priority-normal">${ticket.message_count} messages</span>
+            <span class="badge priority-medium">${ticket.message_count} messages</span>
           </div>
           <div class="meta">${escapeHtml(ticket.created_by)} - ${formatDate(ticket.updated_at)}</div>
         `;
@@ -796,7 +803,7 @@
         });
         newTicketForm.reset();
         document.getElementById("ticket-created-by").value = document.getElementById("current-user").textContent;
-        document.getElementById("ticket-priority").value = "normal";
+        document.getElementById("ticket-priority").value = "low";
         showNotice("Ticket created.", "success");
         await loadTickets();
         await selectTicket(data.ticket.ticket_id);

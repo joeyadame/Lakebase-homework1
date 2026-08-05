@@ -35,7 +35,7 @@ CREATE TABLE IF NOT EXISTS tickets (
     ticket_id TEXT PRIMARY KEY DEFAULT md5(random()::text || clock_timestamp()::text),
     title TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'open',
-    priority TEXT NOT NULL DEFAULT 'normal',
+    priority TEXT NOT NULL DEFAULT 'low',
     created_by TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()

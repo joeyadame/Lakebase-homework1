@@ -31,8 +31,8 @@ logger = logging.getLogger("support-app")
 app = Flask(__name__)
 _w: WorkspaceClient | None = None
 
-STATUSES = ("open", "in_progress", "resolved")
-PRIORITIES = ("low", "normal", "high", "urgent")
+STATUSES = ("open", "in_progress", "resolved", "closed")
+PRIORITIES = ("low", "medium", "high", "urgent")
 MAX_TITLE_LENGTH = 140
 MAX_MESSAGE_LENGTH = 5000
 
@@ -46,52 +46,79 @@ def _workspace_client() -> WorkspaceClient:
     return _w
 
 
+def _ticket_tables_exist() -> bool:
+    rows = lakebase.run_query(
+        """
+        SELECT
+            to_regclass('tickets') IS NOT NULL AS tickets_exists,
+            to_regclass('ticket_messages') IS NOT NULL AS messages_exists
+        """
+    )
+    row = rows[0]
+    return bool(row["tickets_exists"] and row["messages_exists"])
+
+
+def _run_optional_schema_statement(sql: str, label: str) -> None:
+    try:
+        lakebase.run_write(sql)
+    except Exception as err:
+        message = str(err).lower()
+        if "must be owner" in message or "permission denied" in message:
+            logger.warning("Skipping optional schema step %s: %s", label, err)
+            return
+        raise
+
+
 def ensure_schema() -> None:
     """Create the Lakebase tables needed by the support app."""
     global _SCHEMA_READY
     if _SCHEMA_READY:
         return
 
-    lakebase.run_write(
-        """
-        CREATE TABLE IF NOT EXISTS tickets (
-            ticket_id TEXT PRIMARY KEY
-                DEFAULT md5(random()::text || clock_timestamp()::text),
-            title TEXT NOT NULL CHECK (length(trim(title)) > 0),
-            status TEXT NOT NULL DEFAULT 'open'
-                CHECK (status IN ('open', 'in_progress', 'resolved')),
-            priority TEXT NOT NULL DEFAULT 'normal'
-                CHECK (priority IN ('low', 'normal', 'high', 'urgent')),
-            created_by TEXT NOT NULL,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    if not _ticket_tables_exist():
+        lakebase.run_write(
+            """
+            CREATE TABLE IF NOT EXISTS tickets (
+                ticket_id TEXT PRIMARY KEY
+                    DEFAULT md5(random()::text || clock_timestamp()::text),
+                title TEXT NOT NULL CHECK (length(trim(title)) > 0),
+                status TEXT NOT NULL DEFAULT 'open'
+                    CHECK (status IN ('open', 'in_progress', 'resolved', 'closed')),
+                priority TEXT NOT NULL DEFAULT 'low'
+                    CHECK (priority IN ('low', 'medium', 'normal', 'high', 'urgent')),
+                created_by TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
         )
-        """
-    )
-    lakebase.run_write(
-        """
-        CREATE TABLE IF NOT EXISTS ticket_messages (
-            message_id TEXT PRIMARY KEY
-                DEFAULT md5(random()::text || clock_timestamp()::text),
-            ticket_id TEXT NOT NULL
-                REFERENCES tickets(ticket_id) ON DELETE CASCADE,
-            message_text TEXT NOT NULL CHECK (length(trim(message_text)) > 0),
-            author TEXT NOT NULL,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        lakebase.run_write(
+            """
+            CREATE TABLE IF NOT EXISTS ticket_messages (
+                message_id TEXT PRIMARY KEY
+                    DEFAULT md5(random()::text || clock_timestamp()::text),
+                ticket_id TEXT NOT NULL
+                    REFERENCES tickets(ticket_id) ON DELETE CASCADE,
+                message_text TEXT NOT NULL CHECK (length(trim(message_text)) > 0),
+                author TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
         )
-        """
-    )
-    lakebase.run_write(
+
+    _run_optional_schema_statement(
         """
         CREATE INDEX IF NOT EXISTS idx_tickets_status_updated_at
             ON tickets (status, updated_at DESC)
-        """
+        """,
+        "idx_tickets_status_updated_at",
     )
-    lakebase.run_write(
+    _run_optional_schema_statement(
         """
         CREATE INDEX IF NOT EXISTS idx_ticket_messages_ticket_created
             ON ticket_messages (ticket_id, created_at ASC)
-        """
+        """,
+        "idx_ticket_messages_ticket_created",
     )
     _SCHEMA_READY = True
 
@@ -270,7 +297,7 @@ def create_ticket():
 
     title = _clean_text(data.get("title"), collapse=True)
     status = _validate_status(data.get("status", "open"))
-    priority = _validate_priority(data.get("priority", "normal"))
+    priority = _validate_priority(data.get("priority", "low"))
     created_by = _clean_text(data.get("created_by"), collapse=True) or _current_user_email()
     message_text = _clean_text(
         data.get("message_text") or data.get("initial_message"),
