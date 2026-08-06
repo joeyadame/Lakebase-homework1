@@ -22,7 +22,6 @@ for this repo said to ignore the sample-data requirement.
 - `lakebase.py` - Lakebase Postgres connection helper.
 - `templates/index.html` - Ticket dashboard UI.
 - `setup_secrets.py` - One-time helper for storing the Lakebase URL in Databricks secrets.
-- `get_lakebase_password.py` - Helper for printing a temporary Lakebase password/token.
 - `app.yaml` - Databricks Apps deployment config.
 - `.env.example` - Local development environment template.
 
@@ -52,37 +51,14 @@ CREATE TABLE IF NOT EXISTS ticket_messages (
 
 ## Configure Lakebase
 
-The included `app.yaml` keeps the Lakebase resource wiring that Databricks Apps
-can inject at runtime. If your workspace uses that resource, the app can request
-a database credential from Databricks automatically. It sets `ENDPOINT_NAME`
-from the `lakebase-db` resource, and `lakebase.py` uses that to generate a
-short-lived database password/token when the app connects.
-
 You can use this GitHub repo URL as the Databricks App source:
 
 ```text
 https://github.com/joeyadame/Lakebase-homework1.git
 ```
 
-For local testing, or if you want to inspect the generated password before
-deployment, run:
-
-```bash
-python get_lakebase_password.py --endpoint-name projects/<project>/branches/<branch>/endpoints/<endpoint>
-```
-
-To print shell-ready environment variables instead:
-
-```bash
-python get_lakebase_password.py --format env
-```
-
-The generated password/token is temporary. Do not commit it and do not store it
-as the long-term deployment secret.
-
-The template-style fallback is a Lakebase connection URL stored as a Databricks
-secret. Create a Lakebase instance in Databricks and create a native-password
-role for the app. Copy the role connection URL. It should look like:
+Create a Lakebase instance in Databricks and create a native-password role for
+the app. Copy the role's full Postgres connection URL. It should look like:
 
 ```text
 postgresql://<role>:<password>@<host>.database.cloud.databricks.com:5432/databricks_postgres?sslmode=require
@@ -94,9 +70,13 @@ Store that URL in a Databricks secret:
 python setup_secrets.py
 ```
 
+If the URL you paste does not include a password, `setup_secrets.py` prompts
+for the password separately and stores a complete connection URL in the secret.
+
 By default, the app reads secret `database/lakebase-url` when a Lakebase app
-resource is not available. You can override the scope/key with
-`LAKEBASE_SECRET_SCOPE` and `LAKEBASE_SECRET_KEY`.
+starts. You can override the scope/key with `LAKEBASE_SECRET_SCOPE` and
+`LAKEBASE_SECRET_KEY`, but the defaults match `setup_secrets.py` and
+`app.yaml`.
 
 ## Run Locally
 
@@ -109,26 +89,13 @@ python app.py
 
 Open `http://localhost:8000`.
 
-If you have a Postgres-style env file with `PGUSER` and `PGPASSWORD`, place it
-in `.env` and add:
-
-```text
-PGHOST=<your-lakebase-host>
-PGDATABASE=databricks_postgres
-PGPORT=5432
-PGSSLMODE=require
-```
-
-When `PGHOST`, `PGDATABASE`, `PGUSER`, and `PGPASSWORD` are present, the app
-uses those values before falling back to `LAKEBASE_URL`.
-
 ## Deploy As A Databricks App
 
 1. Push this repo to GitHub.
 2. In Databricks, create or open a Git folder for this repo.
 3. Create a Databricks App and point it at the Git folder.
-4. Deploy the app. `app.yaml` runs `python app.py` and includes the Lakebase
-   resource plus the secret fallback settings.
+4. Deploy the app. `app.yaml` runs `python app.py` and points the app at the
+   `database/lakebase-url` secret created by `setup_secrets.py`.
 5. Open the app and create a ticket. Refresh the page to confirm the ticket,
    message, and status changes persisted in Lakebase.
 

@@ -8,6 +8,7 @@ Databricks SDK is authenticated:
 """
 
 import getpass
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.service import workspace
@@ -22,6 +23,36 @@ def ensure_scope(client: WorkspaceClient, scope: str) -> None:
             raise
 
 
+def connection_url_from_prompt() -> str:
+    url = getpass.getpass("Paste your Lakebase connection URL: ").strip()
+    parsed = urlsplit(url)
+
+    if not parsed.scheme.startswith("postgres"):
+        raise SystemExit("Lakebase URL must start with postgresql:// or postgres://")
+    if not parsed.hostname:
+        raise SystemExit("Lakebase URL must include a host name.")
+    if parsed.password:
+        return url
+
+    password = getpass.getpass(
+        "Paste the Lakebase database password for this URL: "
+    ).strip()
+    if not password:
+        raise SystemExit("A password is required when the URL does not include one.")
+
+    username = parsed.username or ""
+    auth = quote(username, safe="%")
+    auth = f"{auth}:{quote(password, safe='')}@"
+    if parsed.port:
+        netloc = f"{auth}{parsed.hostname}:{parsed.port}"
+    else:
+        netloc = f"{auth}{parsed.hostname}"
+
+    return urlunsplit(
+        (parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment)
+    )
+
+
 def main() -> None:
     client = WorkspaceClient()
     scope = "database"
@@ -30,7 +61,7 @@ def main() -> None:
     client.secrets.put_secret(
         scope=scope,
         key="lakebase-url",
-        string_value=getpass.getpass("Paste your Lakebase connection URL: "),
+        string_value=connection_url_from_prompt(),
     )
     client.secrets.put_acl(
         scope=scope,
